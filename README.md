@@ -22,14 +22,17 @@ bash run.sh
 
 Modify the configuration either:
 
-Directly in run.sh, or
+- Directly in `run.sh`, or  
+- Through the `parse_arguments()` function in `tumor_cls.py`
 
-Through the parse_arguments() function in tumor_cls.py
+## 🙏 Acknowledgments
 
-🙏 Acknowledgments
-We would like to thank https://github.com/aywi/mprotonet for open-sourcing their code, which was helpful in the development of this project.
+We would like to thank [https://github.com/aywi/mprotonet](https://github.com/aywi/mprotonet) for open-sourcing their code, which was helpful in the development of this project.
 
-📄 Citation
+## 📄 Citation
+
 If you find this work helpful, please consider citing the following paper:
 
+```
 XXX  # Replace this with your actual BibTeX citation
+```
