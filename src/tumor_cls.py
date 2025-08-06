@@ -1,0 +1,686 @@
+#!/usr/bin/env python3
+
+import argparse
+import ast
+import time
+import warnings
+from functools import partial
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import torchio as tio
+from sklearn.model_selection import ParameterGrid, RepeatedStratifiedKFold
+from torch.utils.data import DataLoader, TensorDataset
+
+from typing import List, Dict
+import random
+
+import models
+import push
+from interpret import attr_methods, attribute
+from utils import (FocalLoss, get_hashes, get_m_indexes, get_transform_aug, iad, lc, load_data,
+                   load_subjs_batch, makedir, output_results, preload, preprocess, print_param,
+                   print_results, process_iad, save_cvs)
+
+import math
+
+
+def sample_modality_mask(
+        batch_size: int,
+        num_modalities: int = 4,
+        missing_ratio: Dict[int, float] = {0: 0.5, 1: 0.3, 2: 0.1, 3: 0.1},
+        device='cpu'
+) -> torch.Tensor:
+    modality_indices = list(range(num_modalities))
+    ratios = list(missing_ratio.items())
+    masks = []
+    for _ in range(batch_size):
+        while True:
+            missing_num = random.choices(
+                [k for k, _ in ratios],
+                weights=[v for _, v in ratios],
+                k=1
+            )[0]
+            if missing_num < num_modalities:  # 避免全缺失
+                break
+        missing_idx = set(random.sample(modality_indices, missing_num))
+        mask = [0 if i in missing_idx else 1 for i in modality_indices]
+        masks.append(mask)
+    return torch.tensor(masks, dtype=torch.float32, device=device)
+
+
+def cosine_alpha(t: int, T: int) -> float:
+    if t < T // 2:
+        return 0
+    else:
+        t = min(max(t, 0), T)
+        return 0.5 * (1 - math.cos(math.pi * (t - T // 2) / (T // 2)))
+
+
+def train(net, data_loader, optimizer, args, grid=None, **kwargs):
+    assert use_amp is not None and scaler is not None and criterion is not None
+    if use_da:
+        torch.backends.cudnn.benchmark = False
+        # torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.deterministic = True
+    else:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+    net.train()
+    if 'MProtoNet' in model_name:
+        return train_mppnet(net, data_loader, optimizer, args, coefs=grid['coefs'], **kwargs)
+    for b, subjs_batch in enumerate(data_loader):
+        data, target, _ = load_subjs_batch(subjs_batch)
+        data = data.to(device, non_blocking=True)
+        target = target.argmax(1).to(device, non_blocking=True)
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
+            output = net(data)
+            loss = criterion(output, target)
+        optimizer.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+
+def train_mppnet(net, data_loader, optimizer, args, use_l1_mask=True, coefs=None, stage=None, log=print):
+    if stage in ['warm_up', 'joint']:
+        log()
+    log(f"\t{stage}", end='', flush=True)
+    start = time.time()
+    n_examples, n_correct, n_batches = 0, 0, 0
+    total_loss, total_cls, total_clst, total_sep, total_avg_sep, total_l1 = 0, 0, 0, 0, 0, 0
+    total_map, total_oc = 0, 0
+    total_al = 0
+
+    for b, subjs_batch in enumerate(data_loader):
+        data, target, _ = load_subjs_batch(subjs_batch)
+        data = data.to(device, non_blocking=True)
+        target = target.argmax(1).to(device, non_blocking=True)
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
+
+            # TODO
+            if getattr(net, 'module.p_mode' if is_parallel else 'p_mode') >= 6:
+                mask = sample_modality_mask(data.shape[0]).to(device)
+                # mask = None
+                output, min_distances, x, p_map, x_mamba, x_feat = net(data, mask)
+
+            elif getattr(net, 'module.p_mode' if is_parallel else 'p_mode') >= 2:
+                output, min_distances, x, p_map = net(data)
+
+            else:
+                output, min_distances = net(data)
+
+            # Calculate classification loss
+            classification = criterion(output, target)
+            loss_cls = coefs['cls'] * classification
+            total_cls += loss_cls.item()
+            
+
+            if stage in ['warm_up', 'joint']:
+                # Calculate cluster loss
+                max_dist = torch.prod(torch.tensor(net.prototype_shape[1:])).to(device)
+                target_weight = class_weight.to(device)[target]
+                target_weight = target_weight / target_weight.sum()
+                prototypes_correct = net.prototype_class_identity[:, target].mT
+                inv_distances_correct = ((max_dist - min_distances) * prototypes_correct).amax(1)
+                cluster = ((max_dist - inv_distances_correct) * target_weight).sum()
+                loss_clst = coefs['clst'] * cluster
+                total_clst += loss_clst.item()
+                # Calculate separation loss
+                prototypes_wrong = 1 - prototypes_correct
+                inv_distances_wrong = ((max_dist - min_distances) * prototypes_wrong).amax(1)
+                separation = ((max_dist - inv_distances_wrong) * target_weight).sum()
+                loss_sep = coefs['sep'] * separation
+                total_sep += loss_sep.item()
+                # Calculate average separation
+                avg_separation = (min_distances * prototypes_wrong).sum(1) / prototypes_wrong.sum(1)
+                avg_separation = (avg_separation * target_weight).sum()
+                total_avg_sep += avg_separation.item()
+                # Calculate mapping loss
+                if getattr(net, 'module.p_mode' if is_parallel else 'p_mode') >= 2:
+                    ri = torch.randint(2, (1,)).item()
+                    f_affine = partial(
+                        F.interpolate, scale_factor=(0.75, 0.875)[ri],
+                        mode='trilinear' if x.ndim == 5 else 'bilinear', align_corners=True
+                    )
+                    f_l1 = lambda t: t.abs().mean()
+                    mapping = f_l1(f_affine(p_map) - net.get_p_map(f_affine(x))) + f_l1(p_map)
+                    loss_map = coefs['map'] * mapping
+                    total_map += loss_map.item()
+
+                # Calculate online-CAM loss
+                if getattr(net, 'module.p_mode' if is_parallel else 'p_mode') >= 4:
+                    p_x = net.lse_pooling(net.p_map[:-3](x).flatten(2))
+                    output2 = net.last_layer(p_x @ net.p_map[-3].weight.flatten(1).mT)
+                    online_cam = criterion(output2, target)
+                    loss_oc = coefs['OC'] * online_cam
+                    total_oc += loss_oc.item()
+                    
+                # loss_al = 0.
+                # """
+                # Calculate align loss (only align x_mamba, whether then all x_missing)
+                if getattr(net, 'module.p_mode' if is_parallel else 'p_mode') >= 6:
+                    align = nn.MSELoss()(x_mamba, x_feat.detach())
+                    loss_al = align * (1 - net.mamba_score)
+                    total_al += loss_al.item()
+                # """
+
+                # Calculate total loss
+                loss = loss_cls + loss_clst + loss_sep
+                if getattr(net, 'module.p_mode' if is_parallel else 'p_mode') >= 2:
+                    loss = loss + loss_map
+                if getattr(net, 'module.p_mode' if is_parallel else 'p_mode') >= 4:
+                    loss = loss + loss_oc
+                if getattr(net, 'module.p_mode' if is_parallel else 'p_mode') >= 6:
+                    loss = loss + loss_al
+            else:
+                # Calculate L1-regularization loss
+                if use_l1_mask:
+                    l1_mask = 1 - net.prototype_class_identity.mT
+                    l1 = torch.linalg.vector_norm(net.last_layer.weight * l1_mask, ord=1)
+                else:
+                    l1 = torch.linalg.vector_norm(net.last_layer.weight, ord=1)
+                loss_l1 = coefs['L1'] * l1
+                total_l1 += loss_l1.item()
+                # Calculate total loss
+                loss = loss_cls + loss_l1
+            total_loss += loss.item()
+            # Evaluation statistics
+            n_examples += target.shape[0]
+            n_correct += (output.data.argmax(1) == target).sum().item()
+            n_batches += 1
+        optimizer.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+    with torch.no_grad():
+        p_avg_pdist = F.pdist(net.prototype_vectors.flatten(1)).mean().item()
+    end = time.time()
+    log(f"\ttime: {end - start:.2f}s,"
+        f" {net.mamba_score},"
+        f" acc: {n_correct / n_examples:.4f},"
+        f" loss: {total_loss / n_batches:.4f},"
+        f" cls: {total_cls / n_batches:.4f},"
+        f" clst: {total_clst / n_batches:.4f},"
+        f" sep: {total_sep / n_batches:.4f},"
+        f" avg_sep: {total_avg_sep / n_batches:.4f},"
+        f" L1: {total_l1 / n_batches:.4f},"
+        f" map: {total_map / n_batches:.4f},"
+        f" OC: {total_oc / n_batches:.4f},"
+        f" AL: {total_al / n_batches:.4f},"
+        f" p_avg_pdist: {p_avg_pdist:.4f}")
+
+
+def test(net, data_loader, grid=None):
+    if not use_da:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    net.eval()
+    f_x, m_f_xes, lcs, iads = [], {}, {}, {}
+    if grid and grid.get('attrs'):
+        methods = grid['attrs']
+    elif 'MProtoNet' in model_name:
+        methods = 'MGU'
+    else:
+        methods = 'GU'
+    with torch.no_grad():
+        for b, subjs_batch in enumerate(data_loader):
+            data, target, seg_map = load_subjs_batch(subjs_batch)
+            data = data.to(device, non_blocking=True)
+            target = target.argmax(1).to(device, non_blocking=True)
+            seg_map = seg_map.to(device, non_blocking=True)
+            f_x.append(F.softmax(net(data), dim=1).cpu().numpy())
+            print("Missing Modalities:", end='', flush=True)
+            m_indexes = get_m_indexes()
+            tic = time.time()
+            for remaining, m_index in m_indexes.items():
+                if m_f_xes.get(remaining) is None:
+                    m_f_xes[remaining] = []
+                data_missing = data.clone()
+                r_index = list(set(range(data.shape[1])) - set(m_index))
+                data_missing[:, m_index] = 0 # data[:, r_index].mean(1, keepdim=True)
+                
+                if hasattr(net, 'p_mode') and net.p_mode >= 6:
+                    modality_mask = torch.ones((data_missing.shape[0], 4)).to(device)
+                    if 'T1' not in remaining:
+                        modality_mask[:, 0] = 0
+                    if 'T1CE' not in remaining:
+                        modality_mask[:, 1] = 0
+                    if 'T2' not in remaining:
+                        modality_mask[:, 2] = 0
+                    if 'FLAIR' not in remaining:
+                        modality_mask[:, 3] = 0
+                    m_f_xes[remaining].append(F.softmax(net(data_missing, modality_mask), dim=1).cpu().numpy())
+                else:
+                    m_f_xes[remaining].append(F.softmax(net(data_missing), dim=1).cpu().numpy())
+
+            toc = time.time()
+            print(f" {toc - tic:.6f}s,", end='', flush=True)
+            for method_i in methods:
+                method = attr_methods[method_i]
+                print(f" {method}:", end='', flush=True)
+                if not lcs.get(method):
+                    lcs[method] = {f'({a}, Th=0.5) {m}': []
+                                   for a in ['WT'] for m in ['AP', 'DSC']}
+                if not iads.get(method):
+                    iads[method] = {m: [] for m in ['IA', 'ID', 'IAD']}
+                tic = time.time()
+
+                if hasattr(net, 'p_mode') and net.p_mode >= 6:
+                    attr = attribute(net, data, target, device, method, modality_mask)
+                else:
+                    attr = attribute(net, data, target, device, method)
+                
+                lcs[method]['(WT, Th=0.5) AP'].append(
+                    lc(attr, seg_map, annos=[1, 2, 4], threshold=0.5, metric='AP'))
+                lcs[method]['(WT, Th=0.5) DSC'].append(
+                    lc(attr, seg_map, annos=[1, 2, 4], threshold=0.5, metric='DSC'))
+                iads[method]['IA'].append(
+                    iad(net, data, attr, n_intervals=50, quantile=True, addition=True))
+                iads[method]['ID'].append(
+                    iad(net, data, attr, n_intervals=50, quantile=True, addition=False))
+                toc = time.time()
+                print(f" {toc - tic:.6f}s,", end='', flush=True)
+            print(" Finished.")
+    for remaining, m_f_x in m_f_xes.items():
+        m_f_xes[remaining] = np.vstack(m_f_x)
+    for method, lcs_ in lcs.items():
+        for metric, lcs__ in lcs_.items():
+            lcs[method][metric] = np.vstack(lcs__)
+    for method, iads_ in iads.items():
+        for metric, iads__ in iads_.items():
+            if metric == 'IAD':
+                continue
+            iads[method][metric] = np.concatenate(iads__, axis=1)
+    return np.vstack(f_x), m_f_xes, lcs, iads
+
+
+def parse_arguments():
+    # Define command-line arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-m', '--model-name', type=str, required=True, help="name of the model")
+    parser.add_argument('-d', '--data-path', type=str,
+                        default='/home/sunzhe/vhua/data/MICCAI_BraTS2020_TrainingData/',
+                        help="path to the data files")
+    parser.add_argument('-n', '--max-n-epoch', type=int, default=200,
+                        help="maximum number of epochs to train on")
+    parser.add_argument('-p', '--param-grid', type=str, default=None,
+                        help="grid of hyper-parameters")
+    parser.add_argument('-s', '--seed', type=int, default=0, help="random seed")
+    parser.add_argument('--bc-opt', type=str,
+                        choices={'Off', 'BCE', 'B2CE', 'CBCE', 'FL', 'BFL', 'B2FL', 'CBFL'},
+                        default='BFL', help="balanced classification option")
+    parser.add_argument('--op-opt', type=str, choices={'Adam', 'AdamW'}, default='AdamW',
+                        help="optimizer option")
+    parser.add_argument('--lr-opt', type=str,
+                        choices={'Off', 'StepLR', 'CosALR', 'WUStepLR', 'WUCosALR'},
+                        default='WUCosALR', help="learning rate scheduler option")
+    parser.add_argument('--lr-n', type=int, default=0, help="learning rate scheduler number")
+    parser.add_argument('--wu-n', type=int, default=0, help="number of warm-up epochs")
+    parser.add_argument('--early-stop', type=int, choices={0, 1}, default=0,
+                        help="whether to enable early stopping")
+    parser.add_argument('--n-workers', type=int, default=8, help="number of workers in data loader")
+    parser.add_argument('--n-threads', type=int, default=4, help="number of CPU threads")
+    parser.add_argument('--preloaded', type=int, choices={0, 1, 2}, default=1,
+                        help="whether to preprocess (1) and preload (2) the dataset")
+    parser.add_argument('--augmented', type=int, choices={0, 1}, default=1,
+                        help="whether to perform data augmentation during training")
+    parser.add_argument('--aug-seq', type=str, default=None, help="data augmentation sequence")
+    parser.add_argument('--use-cuda', type=int, choices={0, 1}, default=1,
+                        help="whether to use CUDA if available")
+    parser.add_argument('--use-amp', type=int, choices={0, 1}, default=1,
+                        help="whether to use automatic mixed precision")
+    parser.add_argument('--use-da', type=int, choices={0, 1}, default=0,
+                        help="whether to use deterministic algorithms.")
+    parser.add_argument('--gpus', type=str, default='0', help="index(es) of GPU(s)")
+    parser.add_argument('--load-model', type=str, default=None,
+                        help="whether to load the model files")
+    parser.add_argument('--save-model', type=int, choices={0, 1}, default=0,
+                        help="whether to save the best model")
+    parser.add_argument('--mamba_dim', type=int, default=64, help="dimension of the mamba model")
+    return parser.parse_args()
+
+
+if __name__ == '__main__':
+    tic = time.time()
+    # Parse command-line arguments
+    args = parse_arguments()
+    model_name, data_path = args.model_name, args.data_path
+    max_n_epoch, param_grid, seed = args.max_n_epoch, args.param_grid, args.seed
+    bc_opt, op_opt, lr_opt, lr_n, wu_n = args.bc_opt, args.op_opt, args.lr_opt, args.lr_n, args.wu_n
+    early_stop, n_workers, n_threads = args.early_stop, args.n_workers, args.n_threads
+    preloaded, augmented, aug_seq = args.preloaded, args.augmented, args.aug_seq
+    use_cuda, use_amp, use_da, gpus = args.use_cuda, args.use_amp, args.use_da, args.gpus
+    load_model, save_model = args.load_model, args.save_model
+    if param_grid is not None:
+        param_grid = ast.literal_eval(param_grid)
+        for k, v in param_grid.items():
+            if not isinstance(v, list):
+                param_grid[k] = [v]
+    else:
+        param_grid = {'batch_size': [32], 'lr': [1e-3], 'wd': [1e-2], 'features': ['resnet152_ri'],
+                      'n_layers': [6]}
+    transform = [tio.ToCanonical(), tio.CropOrPad(target_shape=(192, 192, 144))]
+    transform += [tio.Resample(target=(1.5, 1.5, 1.5))]
+    transform += [tio.ZNormalization()]
+    if augmented:
+        if aug_seq is not None:
+            transform_aug = get_transform_aug(aug_seq=aug_seq)
+        else:
+            transform_aug = get_transform_aug()
+    else:
+        transform_aug = []
+    transform_train = tio.Compose(transform + transform_aug)
+    transform = tio.Compose(transform)
+    if '_pm' in model_name:
+        p_mode = int(model_name[model_name.find('_pm') + 3])
+        model_name = model_name.replace(f'_pm{p_mode}', '')
+    gpu_ids = ast.literal_eval(f'[{gpus}]')
+    device = torch.device(
+        'cuda:' + str(gpu_ids[0]) if use_cuda and torch.cuda.is_available() else 'cpu')
+    use_amp = use_amp == 1 and use_cuda == 1 and torch.cuda.is_available()
+    if use_da:
+        torch.backends.cudnn.benchmark = False
+        # torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.deterministic = True
+    else:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+    torch.set_num_threads(n_threads)
+    opts_hash = get_hashes(args)
+    warnings.filterwarnings('ignore', message="The epoch parameter in `scheduler.step\(\)` was not")
+    # Load data
+    x, y = load_data(data_path)
+    if preloaded:
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        dataset = tio.SubjectsDataset(list(x), transform=transform)
+        if preloaded > 1:
+            data_loader = DataLoader(dataset, batch_size=(n_workers + 1) // 2,
+                                     num_workers=n_workers)
+            x, y, seg = preload(data_loader)
+            n_workers = 0
+        else:
+            data_loader = DataLoader(dataset, num_workers=n_workers)
+            x = preprocess(data_loader)
+            transform_train = tio.Compose(transform_aug) if augmented else None
+            transform = None
+        del dataset, data_loader
+        toc = time.time()
+        print(f"Elapsed time is {toc - tic:.6f} seconds.")
+    cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=1, random_state=seed)
+    cv_train = RepeatedStratifiedKFold(n_splits=5, n_repeats=1, random_state=seed)
+    # 5-fold CV
+    cv_fold = cv.get_n_splits()
+    cv_train_fold = cv_train.get_n_splits()
+    splits = np.zeros(y.shape[0], dtype=int)
+    param_grids = ParameterGrid(param_grid)
+    f_x, m_f_xes, lcs, n_prototypes, iads = np.zeros(y.shape), {}, {}, None, {}
+    for i, (I_train, I_test) in enumerate(cv.split(x, y.argmax(1))):
+
+        # print(I_test, y[I_test])
+        # raise EOFError
+
+        print(f">>>>>>>> CV = {i + 1}:")
+        splits[I_test] = i
+        if len(param_grids) > 1 or early_stop:
+            # TODO: 5-fold inner CV
+            pass
+        else:
+            best_grid = param_grids[0]
+        if early_stop:
+            # TODO: 5-fold inner CV
+            best_n_epoch = max_n_epoch
+        else:
+            best_n_epoch = max_n_epoch
+        # Training and test
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if preloaded > 1:
+            dataset_train = TensorDataset(x[I_train], y[I_train], seg[I_train])
+            dataset_test = TensorDataset(x[I_test], y[I_test], seg[I_test])
+            in_size = (4,) + x.shape[2:]
+            out_size = y.shape[1]
+        else:
+            dataset_train = tio.SubjectsDataset(list(x[I_train]), transform=transform_train)
+            if 'MProtoNet' in model_name:
+                dataset_push = tio.SubjectsDataset(list(x[I_train]), transform=transform)
+            dataset_test = tio.SubjectsDataset(list(x[I_test]), transform=transform)
+            in_size = (4,) + dataset_train[0]['t1']['data'].shape[1:]
+            out_size = dataset_train[0]['label'].shape[0]
+        loader_train = DataLoader(dataset_train, batch_size=best_grid['batch_size'], shuffle=True,
+                                  num_workers=n_workers, pin_memory=True, drop_last=True)
+        loader_test = DataLoader(dataset_test, batch_size=(best_grid['batch_size'] + 1) // 2,
+                                 num_workers=n_workers, pin_memory=True)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        kwargs = {'in_size': in_size, 'out_size': out_size}
+        for arg in ['features', 'n_layers']:
+            if best_grid.get(arg):
+                kwargs[arg] = best_grid[arg]
+        if 'MProtoNet' in model_name:
+            if '_pm' in args.model_name:
+                kwargs['p_mode'] = p_mode
+            for arg in ['prototype_shape', 'f_dist', 'topk_p']:
+                if best_grid.get(arg):
+                    kwargs[arg] = best_grid[arg]
+            kwargs['mamba_dim'] = args.mamba_dim
+        net = getattr(models, model_name)(**kwargs).to(device)
+        if use_cuda and torch.cuda.is_available() and len(gpu_ids) > 1:
+            net = nn.DataParallel(net, device_ids=gpu_ids)
+            is_parallel = True
+        else:
+            is_parallel = False
+        if load_model is not None:
+            if load_model.startswith(args.model_name):
+                model_name_i = f'{load_model}_cv{i}'
+                model_path_i = f'../results/models/{model_name_i}.pt'
+            else:
+                model_name_i = f'{load_model[load_model.find(args.model_name):]}_cv{i}'
+                model_path_i = f'{load_model}_cv{i}.pt'
+        else:
+            model_name_i = f'{args.model_name}_{opts_hash}_cv{i}'
+        print(f"Model: {model_name_i}\n{str(net)}")
+        print_param(net, show_each=False)
+        print(f"Hyper-parameters = {param_grid}")
+        print(f"Best Hyper-parameters = {best_grid}")
+        print(f"Best Number of Epoch = {best_n_epoch}")
+        if 'MProtoNet' in model_name:
+            if preloaded > 1:
+                loader_push = DataLoader(dataset_train, batch_size=best_grid['batch_size'],
+                                         num_workers=n_workers, pin_memory=True)
+            else:
+                loader_push = DataLoader(dataset_push, batch_size=best_grid['batch_size'],
+                                         num_workers=n_workers, pin_memory=True)
+            img_dir = f'../results/saved_imgs/{model_name_i}/'
+            makedir(img_dir)
+            prototype_img_filename_prefix = 'prototype-img'
+            prototype_self_act_filename_prefix = 'prototype-self-act'
+            proto_bound_boxes_filename_prefix = 'bb'
+            params = [
+                {'params': net.add_ons.parameters(), 'lr': best_grid['lr'], 'weight_decay': best_grid['wd']},
+                {'params': net.prototype_vectors, 'lr': best_grid['lr'], 'weight_decay': 0},
+                {'params': net.features.parameters(), 'lr': best_grid['lr'], 'weight_decay': best_grid['wd']}
+            ]
+            if getattr(net, 'module.p_mode' if is_parallel else 'p_mode') >= 2:
+                params += [
+                    {'params': net.p_map.parameters(), 'lr': best_grid['lr'],
+                     'weight_decay': best_grid['wd']},
+                ]
+            if getattr(net, 'module.p_mode' if is_parallel else 'p_mode') >= 6:
+                params += [
+                    {'params': net.encoders.parameters(), 'lr': best_grid['lr'], 'weight_decay': best_grid['wd']},
+                    # {'params': net.mambas.parameters(), 'lr': best_grid['lr'], 'weight_decay': best_grid['wd']},
+                    {'params': net.fuse.parameters(), 'lr': best_grid['lr'], 'weight_decay': best_grid['wd']},
+                ]
+            params_last_layer = [
+                {'params': net.last_layer.parameters(), 'lr': best_grid['lr'],
+                 'weight_decay': 0},
+            ]
+            if op_opt == 'Adam':
+                optimizer = optim.Adam(params)
+                optimizer_last_layer = optim.Adam(params_last_layer)
+            elif op_opt == 'AdamW':
+                optimizer = optim.AdamW(params)
+                optimizer_last_layer = optim.AdamW(params_last_layer)
+            else:
+                optimizer = optim.SGD(params, momentum=0.9)
+                optimizer_last_layer = optim.SGD(params_last_layer, momentum=0.9)
+        else:
+            if op_opt == 'Adam':
+                optimizer = optim.Adam(net.parameters(), lr=best_grid['lr'],
+                                       weight_decay=best_grid['wd'])
+            elif op_opt == 'AdamW':
+                optimizer = optim.AdamW(net.parameters(), lr=best_grid['lr'],
+                                        weight_decay=best_grid['wd'])
+            else:
+                optimizer = optim.SGD(net.parameters(), lr=best_grid['lr'], momentum=0.9,
+                                      weight_decay=best_grid['wd'])
+        if 'WU' in lr_opt and wu_n <= 0:
+            wu_n = best_n_epoch // 5
+        if 'StepLR' in lr_opt:
+            if lr_n <= 0:
+                lr_n = best_n_epoch // 10
+            scheduler = optim.lr_scheduler.StepLR(optimizer, lr_n)
+        elif 'CosALR' in lr_opt:
+            if lr_n <= 0:
+                lr_n = best_n_epoch - wu_n if 'WU' in lr_opt else best_n_epoch
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, lr_n)
+        if 'WU' in lr_opt:
+            scheduler0 = optim.lr_scheduler.LambdaLR(optimizer, lambda e: (e + 1) / wu_n)
+            scheduler = optim.lr_scheduler.SequentialLR(optimizer, [scheduler0, scheduler], [wu_n])
+        if bc_opt in ['BCE', 'BFL']:
+            class_weight = torch.FloatTensor(1 / y[I_train].sum(0))
+        elif bc_opt in ['B2CE', 'B2FL']:
+            class_weight = torch.FloatTensor(1 / y[I_train].sum(0) ** 0.5)
+        elif bc_opt in ['CBCE', 'CBFL']:
+            beta = 1 - 1 / y[I_train].sum()
+            class_weight = torch.FloatTensor((1 - beta) / (1 - beta ** y[I_train].sum(0)))
+        else:
+            class_weight = torch.ones(y[I_train].shape[1])
+        if 'FL' in bc_opt:
+            criterion = FocalLoss(weight=class_weight).to(device)
+        else:
+            criterion = nn.CrossEntropyLoss(weight=class_weight).to(device)
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        if load_model is not None:
+            if is_parallel:
+                net.module.load_state_dict(torch.load(model_path_i, map_location=device))
+                """
+                net.alpha = 1.0
+                push.push_prototypes(
+                        loader_push,
+                        net,
+                        root_dir_for_saving_prototypes=img_dir,
+                        prototype_img_filename_prefix=prototype_img_filename_prefix,
+                        prototype_self_act_filename_prefix=prototype_self_act_filename_prefix,
+                        proto_bound_boxes_filename_prefix=proto_bound_boxes_filename_prefix
+                    )
+                continue
+                """
+            else:
+                net.load_state_dict(torch.load(model_path_i, map_location=device))
+                """
+                net.alpha = 1.0
+                push.push_prototypes(
+                        loader_push,
+                        net,
+                        root_dir_for_saving_prototypes=img_dir,
+                        prototype_img_filename_prefix=prototype_img_filename_prefix,
+                        prototype_self_act_filename_prefix=prototype_self_act_filename_prefix,
+                        proto_bound_boxes_filename_prefix=proto_bound_boxes_filename_prefix
+                    )
+                continue
+                """
+        else:
+            print("Epoch =", end='', flush=True)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+
+            for e in range(best_n_epoch):
+                
+                # TODO delete. ablation study
+                net.mamba_score = min(1, max(0, cosine_alpha(e + 1, best_n_epoch)))
+                # net.mamba_score = 1.
+
+                print(f" {e + 1}", end='', flush=True)
+                if lr_opt != 'Off':
+                    print(f"(lr={scheduler.get_last_lr()[0]:g})", end='', flush=True)
+                train(net, loader_train, optimizer, args, grid=best_grid, stage='joint')
+                if lr_opt != 'Off':
+                    scheduler.step()
+                if 'MProtoNet' in model_name and e + 1 >= 10 and e + 1 in [i for i in
+                                                                           range(best_n_epoch + 1)
+                                                                           if i % 10 == 0]:
+                    if not use_da:
+                        torch.backends.cudnn.benchmark = False
+                        torch.backends.cudnn.deterministic = True
+                    push.push_prototypes(
+                        loader_push,
+                        net,
+                        root_dir_for_saving_prototypes=None if e + 1 < best_n_epoch else img_dir,
+                        prototype_img_filename_prefix=prototype_img_filename_prefix,
+                        prototype_self_act_filename_prefix=prototype_self_act_filename_prefix,
+                        proto_bound_boxes_filename_prefix=proto_bound_boxes_filename_prefix
+                    )
+                    for j in range(10):
+                        train(net, loader_train, optimizer_last_layer, args, grid=best_grid,
+                              stage=f'last_{j}')
+            print()
+        # TODO: Pruning
+        del dataset_train, loader_train
+        if 'MProtoNet' in model_name:
+            del loader_push
+        f_x[I_test], m_f_xes_test, lcs_test, iads_test = test(net, loader_test, grid=best_grid)
+        del dataset_test, loader_test
+        for remaining, m_f_x in m_f_xes_test.items():
+            if m_f_xes.get(remaining) is None:
+                m_f_xes[remaining] = np.zeros(y.shape)
+            m_f_xes[remaining][I_test] = m_f_x
+        for method, lcs_ in lcs_test.items():
+            if not lcs.get(method):
+                lcs[method] = {f'({a}, Th=0.5) {m}': np.zeros((cv_fold, 4))
+                               for a in ['WT'] for m in ['AP', 'DSC']}
+            for metric, lcs__ in lcs_.items():
+                lcs[method][metric][i] = lcs__.mean(0)
+        if 'MProtoNet' in model_name:
+            if n_prototypes is None:
+                n_prototypes = np.zeros((cv_fold, out_size))
+            n_prototypes[i] = net.prototype_class_identity.sum(0).cpu().numpy()
+            n_prototype = n_prototypes[i:i + 1]
+        else:
+            n_prototype = None
+        process_iad(iads_test, y[I_test], model_name=model_name_i)
+        for method, iads_ in iads_test.items():
+            if not iads.get(method):
+                iads[method] = {m: np.zeros((cv_fold, 2)) for m in ['IA', 'ID', 'IAD']}
+            for metric, iads__ in iads_.items():
+                iads[method][metric][i] = iads__
+        print_results("Test", f_x[I_test], y[I_test], m_f_xes_test, lcs_test, n_prototype,
+                      iads_test)
+        if save_model and load_model is None:
+            model_dir = '../results/models/'
+            makedir(model_dir)
+            if is_parallel:
+                torch.save(net.module.state_dict(), f'{model_dir}{model_name_i}.pt')
+            else:
+                torch.save(net.state_dict(), f'{model_dir}{model_name_i}.pt')
+        toc = time.time()
+        print(f"Elapsed time is {toc - tic:.6f} seconds.")
+        print()
+    print(f">>>>>>>> {cv_fold}-fold CV Results:")
+    print_results("Test", f_x, y, m_f_xes, lcs, n_prototypes, iads, splits)
+    output_results("BraTS_2020", args, best_grid['batch_size'], f_x, y, m_f_xes, lcs, n_prototypes,
+                   iads, splits)
+    cv_dir = '../results/cvs/'
+    makedir(cv_dir)
+    save_cvs(cv_dir, args, f_x, y, lcs, iads, splits)
+    print("Finished.")
+    toc = time.time()
+    print(f"Elapsed time is {toc - tic:.6f} seconds.")
+    print()
