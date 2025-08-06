@@ -29,6 +29,7 @@ Modify the configuration either:
 
 We would like to thank [https://github.com/aywi/mprotonet](https://github.com/aywi/mprotonet) for open-sourcing their code, which was helpful in the development of this project.
 
+<!-- 
 ## 📄 Citation
 
 If you find this work helpful, please consider citing the following paper:
@@ -36,3 +37,4 @@ If you find this work helpful, please consider citing the following paper:
 ```
 XXX  # Replace this with your actual BibTeX citation
 ```
+-->
